@@ -5,6 +5,7 @@ import uuid
 from platform import uname
 from typing import List
 
+import GPUtil
 import psutil
 import torch
 
@@ -14,6 +15,12 @@ from vllm._C import cuda_utils
 class Device(enum.Enum):
     GPU = enum.auto()
     CPU = enum.auto()
+
+
+class WorkerType(enum.Enum):
+    PROMPT = enum.auto()
+    TOKEN = enum.auto()
+    MIXED = enum.auto()
 
 
 class Counter:
@@ -71,3 +78,7 @@ def get_open_port() -> int:
 
 def set_cuda_visible_devices(device_ids: List[int]) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
+
+
+def get_total_num_gpus() -> int:
+    return len(GPUtil.getGPUs())

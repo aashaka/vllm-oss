@@ -11,8 +11,9 @@ from vllm.model_executor import set_random_seed
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast_object_list)
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel)
+    initialize_model_parallel, get_tensor_model_parallel_group)
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
+from vllm.utils import get_total_num_gpus, WorkerType
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
 
@@ -34,6 +35,7 @@ class Worker:
         rank: int,
         distributed_init_method: str,
         mscclpp_init_method: str,
+        worker_type: WorkerType = WorkerType.MIXED,
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -43,6 +45,7 @@ class Worker:
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.mscclpp_init_method = mscclpp_init_method
+        self.worker_type = worker_type
         self.is_driver_worker = is_driver_worker
         if self.is_driver_worker:
             assert self.rank == 0, "The driver worker must have rank 0."
@@ -55,6 +58,15 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+
+    def is_prompt_worker(self) -> bool:
+        return self.worker_type == WorkerType.PROMPT
+
+    def is_token_worker(self) -> bool:
+        return self.worker_type == WorkerType.TOKEN
+
+    def is_mixed_worker(self) -> bool:
+        return self.worker_type == WorkerType.MIXED
 
     def init_model(self) -> None:
         # torch.distributed.all_reduce does not free the input tensor until
@@ -91,9 +103,66 @@ class Worker:
                 size=self.parallel_config.world_size,
                 interfaceIpPortTrio=mscclpp_init_method
             )
+            self.mscclpp_conns = None
+            self.worker_type = WorkerType.PROMPT if self.rank < self.parallel_config.num_prompt_workers else WorkerType.TOKEN
 
-    def setup_mscclpp_comm(self):
-        pass
+    def setup_kvcache_comm(self) -> None:
+        # Setup the communication for the KV cache.
+        from vllm.worker.comm_utils import MAX_SEMIDS, SplitCommInfo, KVCacheCommunicator
+        import mscclpp.comm as mscclpp_comm
+
+        self.model_runner.driver_rank = (self.rank // self.parallel_config.num_prompt_workers) * self.parallel_config.num_prompt_workers
+        if self.rank == self.model_runner.driver_rank:
+            self.model_runner.is_driver_worker = True
+
+        corr_worker_rank = (self.mscclpp_group.my_rank + self.parallel_config.num_prompt_workers) % self.mscclpp_group.nranks
+        transport = self.mscclpp_group.my_ib_device(self.mscclpp_group.my_rank % get_total_num_gpus())
+        self.mscclpp_conns = self.mscclpp_group.make_connection(
+            [corr_worker_rank], transport
+        )
+
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        proxy_service = mscclpp_comm.ProxyService()
+        proxy_service.start_proxy()
+
+        memory_ids = [[None, None] for _ in range(num_layers)]
+        for layer_id in range(num_layers):
+            for k_or_v in [0, 1]:
+                memory_ids[layer_id][k_or_v] = self.mscclpp_group.register_memory_with_proxy(
+                    proxy_service,
+                    self.gpu_cache[layer_id][k_or_v],
+                    self.mscclpp_conns,
+                )
+
+        proxy_channels = [None for _ in range(MAX_SEMIDS)]
+        device_handles = [None for _ in range(MAX_SEMIDS)]
+        for sem_id in range(MAX_SEMIDS):
+            proxy_channels[sem_id] = self.mscclpp_group.register_semaphore_with_proxy(
+                proxy_service,
+                self.mscclpp_conns,
+            )[corr_worker_rank]
+            device_handles[sem_id] = proxy_channels[sem_id].device_handle().raw
+
+        all_blocks_size = self.gpu_cache[0][0].numel() * self.gpu_cache[0][0].element_size()
+        block_size = all_blocks_size // self.gpu_cache[0][0].size(0)
+        flush_counter = 0
+        self.split_comm_info = SplitCommInfo(
+            self.worker_type,
+            proxy_service,
+            device_handles,
+            flush_counter,
+            block_size,
+            memory_ids,
+            self.rank,
+            corr_worker_rank,
+        )
+        self.kvcache_comm = KVCacheCommunicator(self.split_comm_info)
+
+    def dismantle_kvcache_comm(self) -> None:
+        self.split_comm_info.proxy_service.stop_proxy()
+        del self.split_comm_info
+        del self.kvcache_comm
+        del self.mscclpp_group
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -116,23 +185,26 @@ class Worker:
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        self.model_runner.profile_run()
+        num_gpu_blocks = float("inf")
+        num_cpu_blocks = float("inf")
+        if not self.is_token_worker():
+            self.model_runner.profile_run()
 
-        # Calculate the number of blocks that can be allocated with the
-        # profiled peak memory.
-        torch.cuda.synchronize()
-        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
-        peak_memory = total_gpu_memory - free_gpu_memory
+            # Calculate the number of blocks that can be allocated with the
+            # profiled peak memory.
+            torch.cuda.synchronize()
+            free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+            peak_memory = total_gpu_memory - free_gpu_memory
 
-        cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, self.model_config, self.parallel_config)
-        num_gpu_blocks = int(
-            (total_gpu_memory * gpu_memory_utilization - peak_memory) //
-            cache_block_size)
-        num_cpu_blocks = int(cpu_swap_space // cache_block_size)
-        num_gpu_blocks = max(num_gpu_blocks, 0)
-        num_cpu_blocks = max(num_cpu_blocks, 0)
-        torch.cuda.empty_cache()
+            cache_block_size = CacheEngine.get_cache_block_size(
+                block_size, self.model_config, self.parallel_config)
+            num_gpu_blocks = int(
+                (total_gpu_memory * gpu_memory_utilization - peak_memory) //
+                cache_block_size)
+            num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+            num_gpu_blocks = max(num_gpu_blocks, 0)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+            torch.cuda.empty_cache()
         return num_gpu_blocks, num_cpu_blocks
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
@@ -184,7 +256,8 @@ class Worker:
         blocks_to_swap_out: Optional[Dict[int, int]] = None,
         blocks_to_copy: Optional[Dict[int, List[int]]] = None,
     ) -> Optional[SamplerOutput]:
-        if self.is_driver_worker:
+        is_prompt = seq_group_metadata_list[0].is_prompt
+        if self.is_driver_worker and ((is_prompt and self.is_prompt_worker()) or (not is_prompt and self.is_token_worker()) or self.is_mixed_worker()):
             assert seq_group_metadata_list is not None
             num_seq_groups = len(seq_group_metadata_list)
             assert blocks_to_swap_in is not None
@@ -194,12 +267,14 @@ class Worker:
                 blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy
             ]
             broadcast_object_list([num_seq_groups] + block_swapping_info,
-                                  src=0)
+                                  src=self.model_runner.driver_rank,
+                                  group=get_tensor_model_parallel_group())
         else:
             # num_seq_groups, blocks_to_swap_in, blocks_to_swap_out,
             # blocks_to_copy (4 elements)
             recv_data = [None] * 4
-            broadcast_object_list(recv_data, src=0)
+            broadcast_object_list(recv_data, src=self.model_runner.driver_rank,
+                                  group=get_tensor_model_parallel_group())
             num_seq_groups = recv_data[0]
             block_swapping_info = recv_data[1:]
 
@@ -213,6 +288,33 @@ class Worker:
                                                  self.gpu_cache)
         return output
 
+    def set_gpucache(self):
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        for layer_id in range(num_layers):
+            for k_or_v in [0, 1]:
+                self.gpu_cache[layer_id][k_or_v][:] = self.rank * (num_layers * 2) + layer_id * 2 + k_or_v
+        torch.cuda.synchronize()
+
+    def send_recv_kvcache_all(self):
+        num_gpu_blocks = self.cache_config.num_gpu_blocks
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        if self.rank < self.parallel_config.num_prompt_workers:
+            for layer_id in range(num_layers):
+                self.kvcache_comm.put(0, layer_id, 0, num_gpu_blocks)
+            self.kvcache_comm.signal_and_flush(0)
+        else:
+            self.kvcache_comm.wait(0)
+        torch.cuda.synchronize()
+
+    def check_gpucache(self):
+        num_prompt_workers = self.parallel_config.num_prompt_workers
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        expected_worker_id = self.rank if self.rank < num_prompt_workers else self.rank - num_prompt_workers
+        for layer_id in range(num_layers):
+            for k_or_v in [0, 1]:
+                expected_scalar = (expected_worker_id * (num_layers * 2) + layer_id * 2 + k_or_v)
+                expected_tensor = torch.ones_like(self.gpu_cache[layer_id][k_or_v]) * expected_scalar
+                assert torch.allclose(self.gpu_cache[layer_id][k_or_v], expected_tensor)
 
 def _init_distributed_environment(
     parallel_config: ParallelConfig,
@@ -242,7 +344,8 @@ def _init_distributed_environment(
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
-                              parallel_config.pipeline_parallel_size)
+                              parallel_config.pipeline_parallel_size,
+                              parallel_config.sep_prompt_token)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

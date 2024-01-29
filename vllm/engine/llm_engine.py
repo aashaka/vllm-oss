@@ -115,7 +115,7 @@ class LLMEngine:
 
         if self.parallel_config.sep_prompt_token:
             # Setup the MSCCL++ communication required for KV cache transfer
-            self._setup_mscclpp_comm()
+            self._setup_kvcache_comm()
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
@@ -323,9 +323,13 @@ class LLMEngine:
         # if enforce_eager is False.
         self._run_workers("warm_up_model")
 
-    def _setup_mscclpp_comm(self) -> None:
+    def _setup_kvcache_comm(self) -> None:
         """Setup MSCCL++ communication connections for KV cache transfer."""
-        self._run_workers("setup_mscclpp_comm")
+        self._run_workers("setup_kvcache_comm")
+
+    def dismantle_kvcache_comm(self) -> None:
+        """Stop MSCCL++ communication connections for KV cache transfer."""
+        self._run_workers("dismantle_kvcache_comm")
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":

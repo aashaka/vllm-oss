@@ -55,6 +55,7 @@ def tensor_model_parallel_gather(input_, dst=0, dim=-1):
     all the ranks.
     """
     world_size = get_tensor_model_parallel_world_size()
+    print("------ TP world_size", world_size, dst, get_tensor_model_parallel_rank(), flush=True)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -80,7 +81,7 @@ def tensor_model_parallel_gather(input_, dst=0, dim=-1):
     return output_tensor
 
 
-def broadcast(input_, src=0):
+def broadcast(input_, src=0, group=None):
     """Broadcast the input tensor."""
     world_size = torch.distributed.get_world_size()
     assert 0 <= src < world_size, f"Invalid src rank ({src})"
@@ -89,11 +90,11 @@ def broadcast(input_, src=0):
     if world_size == 1:
         return input_
     # Broadcast.
-    torch.distributed.broadcast(input_, src=src)
+    torch.distributed.broadcast(input_, src=src, group=group)
     return input_
 
 
-def broadcast_object_list(obj_list, src=0):
+def broadcast_object_list(obj_list, src=0, group=None):
     """Broadcast the input object list."""
     world_size = torch.distributed.get_world_size()
     assert 0 <= src < world_size, f"Invalid src rank ({src})"
@@ -102,5 +103,5 @@ def broadcast_object_list(obj_list, src=0):
     if world_size == 1:
         return obj_list
     # Broadcast.
-    torch.distributed.broadcast_object_list(obj_list, src=src)
+    torch.distributed.broadcast_object_list(obj_list, src=src, group=group)
     return obj_list

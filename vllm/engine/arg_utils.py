@@ -23,6 +23,7 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
+    sep_prompt_token: bool = False
     block_size: int = 16
     swap_space: int = 4  # GiB
     gpu_memory_utilization: float = 0.90
@@ -141,6 +142,9 @@ class EngineArgs:
             help='load model sequentially in multiple batches, '
             'to avoid RAM OOM when using tensor '
             'parallel and large models')
+        parser.add_argument('--sep-prompt-token',
+                            action='store_true',
+                            help='separate the prompt processing and token sampling')
         # KV cache arguments
         parser.add_argument('--block-size',
                             type=int,
@@ -229,7 +233,8 @@ class EngineArgs:
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
                                          self.worker_use_ray,
-                                         self.max_parallel_loading_workers)
+                                         self.max_parallel_loading_workers,
+                                         self.sep_prompt_token)
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
