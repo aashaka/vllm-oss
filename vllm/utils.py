@@ -3,7 +3,7 @@ import os
 import socket
 import uuid
 from platform import uname
-from typing import List
+from typing import Dict, List
 
 import GPUtil
 import psutil
@@ -82,3 +82,29 @@ def set_cuda_visible_devices(device_ids: List[int]) -> None:
 
 def get_total_num_gpus() -> int:
     return len(GPUtil.getGPUs())
+
+
+def coalesce_blocks(block_list: List[int]):
+    '''Coalesce of list of blocks to exploit contiguous chunks.
+    '''
+    if not block_list:
+        return []
+    sorted_block_list = sorted(block_list)
+    ret = []
+    current_block_start = sorted_block_list[0]
+    current_block_length = 1
+    for i in range(1, len(sorted_block_list)):
+        if sorted_block_list[i] == sorted_block_list[i - 1] + 1:
+            current_block_length += 1
+        else:
+            ret.append((current_block_start, current_block_length))
+            current_block_start = sorted_block_list[i]
+            current_block_length = 1
+    ret.append((current_block_start, current_block_length))
+    return ret
+
+
+def coalesce_blocks_by_id(blocks_to_nw_dict: Dict[int, List[int]]):
+    for cur_id in blocks_to_nw_dict:
+        blocks_to_nw_dict[cur_id] = coalesce_blocks(blocks_to_nw_dict[cur_id])
+    return blocks_to_nw_dict

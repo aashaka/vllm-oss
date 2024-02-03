@@ -30,6 +30,7 @@ class Sampler(nn.Module):
     def __init__(self, vocab_size: int) -> None:
         super().__init__()
         self.vocab_size = vocab_size
+        self.dst_rank = None
 
     def forward(
         self,
@@ -37,13 +38,12 @@ class Sampler(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
-        dst_rank: Optional[int] = None,
     ) -> Optional[SamplerOutput]:
         # Get the hidden states that we use for sampling.
         hidden_states = _prune_hidden_states(hidden_states, sampling_metadata)
 
         # Get the logits for the next tokens.
-        dst_rank = 0 if dst_rank is None else dst_rank
+        dst_rank = 0 if self.dst_rank is None else self.dst_rank
         logits = _get_logits(hidden_states, embedding, embedding_bias,
                              self.vocab_size, dst_rank)
 

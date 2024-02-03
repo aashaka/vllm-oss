@@ -380,6 +380,7 @@ class ModelRunner:
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        blocks_to_nw: Optional[Dict[int, List[int]]],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata]:
         if self.is_driver_worker:
             # NOTE: We assume that all sequences in the group are all prompts or
@@ -517,6 +518,7 @@ class ModelRunner:
                 perform_sampling=False,
             )
 
+        input_metadata.blocks_to_nw = blocks_to_nw
         return input_tokens, input_positions, input_metadata, sampling_metadata
 
     @torch.inference_mode()
@@ -524,11 +526,10 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        blocks_to_nw: Dict[int, List[int]] = {},
     ) -> Optional[SamplerOutput]:
-        print(f"Inside model_runner:execute_model {self.driver_rank}", flush=True)
         input_tokens, input_positions, input_metadata, sampling_metadata = (
-            self.prepare_input_tensors(seq_group_metadata_list))
-        print(f"prepare_input_tensors {self.driver_rank}", flush=True)
+            self.prepare_input_tensors(seq_group_metadata_list, blocks_to_nw))
         # Execute the model.
         if input_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
@@ -546,7 +547,6 @@ class ModelRunner:
         output = self.model.sample(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
-            dst_rank=self.driver_rank
         )
         return output
 
