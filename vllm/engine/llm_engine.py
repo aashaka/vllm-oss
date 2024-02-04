@@ -19,7 +19,6 @@ from vllm.sequence import (SamplerOutput, Sequence, SequenceGroup,
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                get_tokenizer)
 from vllm.utils import Counter, set_cuda_visible_devices, get_ip, get_open_port
-from vllm.worker.comm_utils import Seq2SemMapper
 
 if ray:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -100,7 +99,6 @@ class LLMEngine:
             tokenizer_revision=model_config.tokenizer_revision,
             revision=model_config.revision)
         self.seq_counter = Counter()
-        self.seq2sem_mapper = Seq2SemMapper() if self.parallel_config.sep_prompt_token else None
 
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
@@ -120,7 +118,9 @@ class LLMEngine:
             self._setup_kvcache_comm()
 
         # Create the scheduler.
-        self.scheduler = Scheduler(scheduler_config, cache_config, self.seq2sem_mapper)
+        # Track prompt blocks if prompt token is separated from the token
+        self.scheduler = Scheduler(scheduler_config, cache_config,
+                                   self.parallel_config.sep_prompt_token)
 
         # Logging.
         self.last_logging_time = 0.0
@@ -773,17 +773,15 @@ class LLMEngine:
         if scheduler_outputs.is_empty():
             output = []
         elif self.parallel_config.sep_prompt_token:
-            prompt_stage = True if seq_group_metadata_list[0].is_prompt else False
             all_outputs = self._run_stage_workers(
                 "execute_model",
-                prompt_stage=prompt_stage,
+                prompt_stage=seq_group_metadata_list[0].is_prompt,
                 driver_kwargs={
                     "seq_group_metadata_list": seq_group_metadata_list,
                     "blocks_to_swap_in": scheduler_outputs.blocks_to_swap_in,
                     "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
                     "blocks_to_copy": scheduler_outputs.blocks_to_copy,
                     "blocks_to_nw": scheduler_outputs.blocks_to_nw,
-                    "seq_to_sem_map": self.seq2sem_mapper.seq_to_sem,
                 })
 
             # Only the driver worker returns the sampling results.
@@ -798,7 +796,6 @@ class LLMEngine:
                     "blocks_to_swap_out": scheduler_outputs.blocks_to_swap_out,
                     "blocks_to_copy": scheduler_outputs.blocks_to_copy,
                     "blocks_to_nw": {},
-                    "seq_to_sem_map": {},
                 })
 
             # Only the driver worker returns the sampling results.

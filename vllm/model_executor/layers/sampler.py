@@ -32,6 +32,9 @@ class Sampler(nn.Module):
         self.vocab_size = vocab_size
         self.dst_rank = None
 
+    def set_dst_rank(self, dst_rank: int) -> None:
+        self.dst_rank = dst_rank
+
     def forward(
         self,
         embedding: torch.Tensor,

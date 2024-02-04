@@ -10,8 +10,7 @@ from vllm.logger import init_logger
 from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceStatus)
 from vllm.prefix import PrefixPool
-from vllm.utils import coalesce_blocks_by_id
-from vllm.worker.comm_utils import Seq2SemMapper
+from vllm.utils import SeqToSlotMapper, coalesce_blocks_by_id
 
 logger = init_logger(__name__)
 
@@ -66,11 +65,14 @@ class Scheduler:
         self,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
-        seq_sem_mapper: Optional[Seq2SemMapper] = None,
+        track_prompt_blocks: bool = False,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
-        self.seq_sem_mapper = seq_sem_mapper
+        self.track_prompt_blocks = track_prompt_blocks
+        self.seq_to_slot_mapper: Optional[SeqToSlotMapper] = None
+        if track_prompt_blocks:
+            self.seq_to_slot_mapper = SeqToSlotMapper()
 
         self.prompt_limit = min(self.scheduler_config.max_model_len,
                                 self.scheduler_config.max_num_batched_tokens)
@@ -220,14 +222,14 @@ class Scheduler:
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
                 scheduled.append(seq_group)
-                if self.seq_sem_mapper is not None:
+                if self.track_prompt_blocks:
                     for seq in seq_group.get_seqs():
                         # Populate blocks_to_nw for the sequences in prompt phase
                         # and first step of generation phase
                         if seq.get_output_len() <= 1:
                             block_ids = self.block_manager.get_block_table(seq)
-                            sem_id = self.seq_sem_mapper.get_sem_id(seq.seq_id)
-                            blocks_to_nw[sem_id].extend(block_ids)
+                            slot_id = self.seq_to_slot_mapper.get_slot_id(seq.seq_id)
+                            blocks_to_nw[slot_id].extend(block_ids)
 
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
@@ -304,15 +306,15 @@ class Scheduler:
             seq_group.num_seqs(status=SequenceStatus.RUNNING)
             for seq_group in self.running)
 
-        if self.seq_sem_mapper is not None:
+        if self.track_prompt_blocks:
             for seq_group in self.running:
                 for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                     # Populate blocks_to_nw for the sequences in prompt phase
                     # and first step of generation phase
                     if seq.get_output_len() <= 1:
                         block_ids = self.block_manager.get_block_table(seq)
-                        sem_id = self.seq_sem_mapper.get_sem_id(seq.seq_id)
-                        blocks_to_nw[sem_id].extend(block_ids)
+                        slot_id = self.seq_to_slot_mapper.get_slot_id(seq.seq_id)
+                        blocks_to_nw[slot_id].extend(block_ids)
 
         scheduler_outputs = SchedulerOutputs(
             scheduled_seq_groups=self.running,
@@ -358,8 +360,8 @@ class Scheduler:
 
     def free_seq(self, seq: Sequence) -> None:
         self.block_manager.free(seq)
-        if self.seq_sem_mapper is not None:
-            self.seq_sem_mapper.free_seq(seq.seq_id)
+        if self.seq_to_slot_mapper is not None:
+            self.seq_to_slot_mapper.free_seq(seq.seq_id)
 
     def free_finished_seq_groups(self) -> None:
         self.running = [
@@ -371,8 +373,8 @@ class Scheduler:
         self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
-            if self.seq_sem_mapper is not None:
-                self.seq_sem_mapper.set_seq(seq.seq_id)
+            if self.seq_to_slot_mapper is not None:
+                self.seq_to_slot_mapper.set_seq(seq.seq_id)
 
     def _append_slot(
         self,

@@ -10,13 +10,10 @@ from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast, broadcast_object_list)
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_group,
-)
+from vllm.model_executor.parallel_utils.parallel_state import get_tensor_model_parallel_group
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
 from vllm.utils import in_wsl
-
 
 logger = init_logger(__name__)
 
@@ -382,6 +379,8 @@ class ModelRunner:
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         blocks_to_nw: Optional[Dict[int, List[int]]],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata]:
+        src = self.driver_rank
+        tp_group = get_tensor_model_parallel_group()
         if self.is_driver_worker:
             # NOTE: We assume that all sequences in the group are all prompts or
             # all decodes.
@@ -431,73 +430,73 @@ class ModelRunner:
                 "selected_token_indices_size":
                 sampling_metadata.selected_token_indices.size(),
             }
-            broadcast_object_list([py_data], src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast_object_list([py_data], src=src, group=tp_group)
             # TODO(zhuohan): Combine the broadcasts or set async_op=True.
-            broadcast(input_tokens, src=self.driver_rank, group=get_tensor_model_parallel_group())
-            broadcast(input_positions, src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast(input_tokens, src=src, group=tp_group)
+            broadcast(input_positions, src=src, group=tp_group)
             if input_metadata.slot_mapping is not None:
-                broadcast(input_metadata.slot_mapping, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(input_metadata.slot_mapping, src=src, group=tp_group)
             if input_metadata.prompt_lens is not None:
-                broadcast(input_metadata.prompt_lens, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(input_metadata.prompt_lens, src=src, group=tp_group)
             if input_metadata.start_loc is not None:
-                broadcast(input_metadata.start_loc, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(input_metadata.start_loc, src=src, group=tp_group)
             if input_metadata.context_lens is not None:
-                broadcast(input_metadata.context_lens, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(input_metadata.context_lens, src=src, group=tp_group)
             if input_metadata.block_tables is not None:
-                broadcast(input_metadata.block_tables, src=self.driver_rank, group=get_tensor_model_parallel_group())
-            broadcast(sampling_metadata.selected_token_indices, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(input_metadata.block_tables, src=src, group=tp_group)
+            broadcast(sampling_metadata.selected_token_indices, src=src, group=tp_group)
         else:
             receving_list = [None]
-            broadcast_object_list(receving_list, src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast_object_list(receving_list, src=src, group=tp_group)
             py_data = receving_list[0]
             input_tokens = torch.empty(*py_data["input_tokens_size"],
                                        dtype=torch.long,
                                        device="cuda")
-            broadcast(input_tokens, src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast(input_tokens, src=src, group=tp_group)
             input_positions = torch.empty(*py_data["input_positions_size"],
                                           dtype=torch.long,
                                           device="cuda")
-            broadcast(input_positions, src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast(input_positions, src=src, group=tp_group)
             if py_data["slot_mapping_size"] is not None:
                 slot_mapping = torch.empty(*py_data["slot_mapping_size"],
                                            dtype=torch.long,
                                            device="cuda")
-                broadcast(slot_mapping, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(slot_mapping, src=src, group=tp_group)
             else:
                 slot_mapping = None
             if py_data["prompt_lens_size"] is not None:
                 prompt_lens = torch.empty(*py_data["prompt_lens_size"],
                                           dtype=torch.long,
                                           device="cuda")
-                broadcast(prompt_lens, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(prompt_lens, src=src, group=tp_group)
             else:
                 prompt_lens = None
             if py_data["start_loc_size"] is not None:
                 start_loc = torch.empty(*py_data["start_loc_size"],
                                         dtype=torch.long,
                                         device="cuda")
-                broadcast(start_loc, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(start_loc, src=src, group=tp_group)
             else:
                 start_loc = None
             if py_data["context_lens_size"] is not None:
                 context_lens = torch.empty(*py_data["context_lens_size"],
                                            dtype=torch.int,
                                            device="cuda")
-                broadcast(context_lens, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(context_lens, src=src, group=tp_group)
             else:
                 context_lens = None
             if py_data["block_tables_size"] is not None:
                 block_tables = torch.empty(*py_data["block_tables_size"],
                                            dtype=torch.int,
                                            device="cuda")
-                broadcast(block_tables, src=self.driver_rank, group=get_tensor_model_parallel_group())
+                broadcast(block_tables, src=src, group=tp_group)
             else:
                 block_tables = None
             selected_token_indices = torch.empty(
                 *py_data["selected_token_indices_size"],
                 dtype=torch.long,
                 device="cuda")
-            broadcast(selected_token_indices, src=self.driver_rank, group=get_tensor_model_parallel_group())
+            broadcast(selected_token_indices, src=src, group=tp_group)
             input_metadata = InputMetadata(
                 is_prompt=py_data["is_prompt"],
                 slot_mapping=slot_mapping,
